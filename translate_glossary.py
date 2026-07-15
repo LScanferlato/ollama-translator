@@ -36,11 +36,42 @@ from pathlib import Path
 
 import requests
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
+OLLAMA_BASE = "http://localhost:11434"
+OLLAMA_URL = OLLAMA_BASE + "/api/generate"
+OLLAMA_TAGS_URL = OLLAMA_BASE + "/api/tags"
 MODEL = "abb-decide/apertus-tools:8b-instruct-2509-q4_k_m"
-DELAY = 0.1
 
+
+def normalizza_base(url):
+    """Assicura che l'URL base abbia lo schema http(s):// e niente slash
+    finale. Accetta anche indirizzi senza schema (es. '192.168.1.5:11434')."""
+    u = (url or "").strip()
+    if not u:
+        return u
+    if not u.startswith(("http://", "https://")):
+        u = "http://" + u
+    return u.rstrip("/")
+
+
+class Ritmo:
+    """Delay adattivo per server: diminuisce (AIMD) quando il server
+    risponde senza problemi, aumenta (backoff) in caso di errori/retry,
+    così l'esecuzione viene ottimizzata senza sovraccaricare."""
+
+    MIN = 0.05
+    MAX = 10.0
+    DECREASE = 0.85   # moltiplicativo, su successo
+    INCREASE = 0.5    # additivo, su congestione/errore
+
+    def __init__(self, start):
+        self.delay = max(self.MIN, float(start))
+
+    def ok(self):
+        self.delay = max(self.MIN, self.delay * self.DECREASE)
+
+    def congestione(self):
+        self.delay = min(self.MAX, self.delay + self.INCREASE)
+DELAY = 0.25
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 SALVA_OGNI_N = 25
@@ -48,8 +79,12 @@ SALVA_OGNI_N = 25
 DEBUG = True
 
 
+log_lock = threading.Lock()
+
+
 def log(msg):
-    print(msg, flush=True)
+    with log_lock:
+        print(msg, flush=True)
 
 
 # ─── Colori per lingua ─────────────────────────────────────────
@@ -226,7 +261,7 @@ def prima_variante(s):
     return s.strip()
 
 
-def traduci(testo, lingua, modello=MODEL, session=None, contesto=None):
+def traduci(testo, lingua, modello=MODEL, session=None, contesto=None, base_url=OLLAMA_URL, ritmo=None):
     lingua_nome = nome_lingua(lingua)
     prompt = (
         f"{testo}\n\n"
@@ -256,15 +291,22 @@ def traduci(testo, lingua, modello=MODEL, session=None, contesto=None):
     sess = session or requests
     for tentativo in range(1, MAX_RETRIES + 1):
         try:
-            resp = sess.post(OLLAMA_URL, json=payload, timeout=120)
+            resp = sess.post(base_url, json=payload, timeout=120)
             resp.raise_for_status()
             raw = resp.json()["response"].strip()
+            if ritmo is not None:
+                if tentativo > 1:
+                    ritmo.congestione()
+                else:
+                    ritmo.ok()
             return rimuovi_qualificatori_ue(pulisci_risposta(raw, lingua))
         except Exception as e:
             if tentativo < MAX_RETRIES:
                 attesa = RETRY_DELAY * tentativo
                 log(f"  ERRORE (tentativo {tentativo}/{MAX_RETRIES}): {e} -> riprovo tra {attesa}s")
                 time.sleep(attesa)
+                if ritmo is not None:
+                    ritmo.congestione()
             else:
                 log(f"  ERRORE traduzione '{testo}' -> {lingua}: {e}")
                 return ""
@@ -290,7 +332,9 @@ def carica_csv(path):
                 f"leggerlo. Il file potrebbe essere stato troncato da una "
                 f"esecuzione interrotta; ripristinalo da un backup.")
         fieldnames = [h.strip() for h in fn]
-        righe = [{k.strip(): v for k, v in row.items()} for row in reader]
+        righe = [{(k.strip() if isinstance(k, str) else k): (v if isinstance(v, str) else "")
+                 for k, v in row.items() if k is not None}
+                for row in reader]
     return righe, fieldnames
 
 
@@ -374,6 +418,14 @@ def main():
                         help="Colonna sorgente per la traduzione (default: it)")
     parser.add_argument("--model", default="",
                         help=f"Modello Ollama (default: {MODEL}; se omesso, lista interattiva)")
+    parser.add_argument("--ollama-url", default=None,
+                        help=f"URL base del server Ollama principale "
+                             f"(default: {OLLAMA_BASE})")
+    parser.add_argument("--ollama-url2", default=None,
+                        help="URL base di un SECONDO server Ollama: il file "
+                             "viene elaborato in parallelo (server1 in avanti "
+                             "dalla metà iniziale, server2 all'indietro dalla "
+                             "metà finale) per dimezzare il tempo.")
     parser.add_argument("--delay", type=float, default=DELAY,
                         help=f"Secondi tra richieste (default: {DELAY})")
     parser.add_argument("-n", "--max-lines", type=int, default=0,
@@ -478,53 +530,102 @@ def main():
 
     esc_thread = avvia_controllo_esc()
 
-    try:
-        for i, riga in enumerate(da_elaborare, 1):
-            sorgente = testo_sorgente(riga)
-            if not sorgente:
-                log(f"[{i}/{len(da_elaborare)}] (nessun testo sorgente, saltata)")
+    def process_row(i, riga, session, base_url, ritmo):
+        """Traduce una singola riga (muta `riga`). Restituisce il numero di
+        lingue tradotte. Sicuro da chiamare da più thread."""
+        sorgente = testo_sorgente(riga)
+        if not sorgente:
+            log(f"[{i}/{len(da_elaborare)}] (nessun testo sorgente, saltata)")
+            return 0
+
+        tradotte = 0
+        for lingua in target_langs:
+            if interruzione.is_set():
+                break
+            val_attuale = riga.get(lingua, "")
+            if val_attuale.strip() and not args.overwrite:
                 continue
 
-            tradotte = 0
-            for lingua in target_langs:
+            # riferimenti: altre lingue sulla stessa riga
+            contesto = {}
+            refs = context_langs if context_langs else [
+                c for c in fieldnames if c not in (lingua, args.source_col, "source_term")]
+            for code in refs:
+                if code == lingua:
+                    continue
+                v = riga.get(code, "").strip()
+                if v:
+                    contesto[code] = prima_variante(v)
+
+            trad = traduci(sorgente, lingua, modello=modello,
+                           session=session, contesto=contesto,
+                           base_url=base_url, ritmo=ritmo)
+            riga[lingua] = trad
+            log(f"{colore_lingua(lingua)}: {trad}")
+            tradotte += 1
+            if ritmo.delay > 0:
+                time.sleep(ritmo.delay)
+
+        if tradotte == 0 and not interruzione.is_set():
+            log(f"[{i}/{len(da_elaborare)}] '{sorgente}' — già completo")
+        else:
+            log(f"[{i}/{len(da_elaborare)}] '{sorgente}' — {tradotte} lingue tradotte")
+        return tradotte
+
+    lavori = list(enumerate(da_elaborare, 1))  # [(i, riga), ...]
+    base1 = normalizza_base(args.ollama_url or OLLAMA_BASE)
+    base2 = normalizza_base(args.ollama_url2) if args.ollama_url2 else None
+    url1 = base1 + "/api/generate"
+    url2 = base2 + "/api/generate" if base2 else None
+
+    try:
+        if url2:
+            # ─── Modalità parallela su due server ──────────────────────
+            # server1 elabora la prima metà in avanti; server2 elabora la
+            # seconda metà a ritroso (dalla fine), così si incontrano a metà.
+            # Ogni server ha il suo ritmo (delay adattivo) indipendente.
+            log(f"Modalità PARALLELA: server1={base1} (avanti), "
+                f"server2={base2} (indietro dalla fine).")
+            mid = len(lavori) // 2
+            l1 = lavori[:mid]
+            l2 = list(reversed(lavori[mid:]))  # dalla fine
+            s1 = requests.Session()
+            s2 = requests.Session()
+            r1 = Ritmo(args.delay or DELAY)
+            r2 = Ritmo(args.delay or DELAY)
+
+            def worker(sub, sess, url, ritmo):
+                for i, riga in sub:
+                    if interruzione.is_set():
+                        break
+                    process_row(i, riga, sess, url, ritmo)
+
+            t1 = threading.Thread(target=worker, args=(l1, s1, url1, r1), daemon=True)
+            t2 = threading.Thread(target=worker, args=(l2, s2, url2, r2), daemon=True)
+            t1.start()
+            t2.start()
+            while t1.is_alive() or t2.is_alive():
+                t1.join(0.2)
+                t2.join(0.2)
                 if interruzione.is_set():
                     break
-                val_attuale = riga.get(lingua, "")
-                if val_attuale.strip() and not args.overwrite:
-                    continue
-
-                # riferimenti: altre lingue sulla stessa riga
-                contesto = {}
-                refs = context_langs if context_langs else [
-                    c for c in fieldnames if c not in (lingua, args.source_col, "source_term")]
-                for code in refs:
-                    if code == lingua:
-                        continue
-                    v = riga.get(code, "").strip()
-                    if v:
-                        contesto[code] = prima_variante(v)
-
-                trad = traduci(sorgente, lingua, modello=modello,
-                               session=session, contesto=contesto)
-                riga[lingua] = trad
-                log(f"{colore_lingua(lingua)}: {trad}")
-                tradotte += 1
-                if delay:
-                    time.sleep(delay)
-
-            if tradotte == 0 and not interruzione.is_set():
-                log(f"[{i}/{len(da_elaborare)}] '{sorgente}' — già completo")
-            else:
-                log(f"[{i}/{len(da_elaborare)}] '{sorgente}' — {tradotte} lingue tradotte")
-
-            if args.save_interval > 0 and i % args.save_interval == 0:
-                salva_csv(path, righe, fieldnames)
-                log(f"(salvato progresso: riga {i})")
-            log("")
-
-            if interruzione.is_set():
-                log("Interruzione (ESC) richiesta: salvo ed esco.")
-                break
+            interruzione.set()  # ferma i worker se non già fermi
+            t1.join()
+            t2.join()
+            salva_csv(path, righe, fieldnames)
+            log("Elaborazione parallela completata e salvata.")
+        else:
+            # ─── Modalità singolo server (comportamento standard) ───────
+            ritmo = Ritmo(args.delay or DELAY)
+            for i, riga in lavori:
+                if interruzione.is_set():
+                    log("Interruzione (ESC) richiesta: salvo ed esco.")
+                    break
+                process_row(i, riga, session, url1, ritmo)
+                if args.save_interval > 0 and i % args.save_interval == 0:
+                    salva_csv(path, righe, fieldnames)
+                    log(f"(salvato progresso: riga {i})")
+                log("")
     except KeyboardInterrupt:
         log("\nInterruzione (Ctrl+C) richiesta: salvo ed esco.")
     finally:
